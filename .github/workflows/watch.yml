@@ -1,0 +1,62 @@
+name: VOX Showtimes Watcher
+
+# Runs on a schedule (no server, no credit card needed).
+# GitHub's minimum cron granularity is 5 min; ~*/10 is a polite, reliable choice.
+# NOTE: scheduled runs can be delayed a few minutes when GitHub is busy — fine
+# for "notify me when next-week opens". You can also trigger it manually.
+on:
+  schedule:
+    - cron: "*/10 * * * *"     # every 10 minutes
+  workflow_dispatch:            # lets you run it on demand from the Actions tab
+
+# Avoid overlapping runs.
+concurrency:
+  group: vox-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip + Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: vox-deps-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      # Persist which dates were already alerted, so we don't ping every run.
+      - name: Restore alert-state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: vox-state-${{ github.run_id }}
+          restore-keys: |
+            vox-state-
+
+      - name: Run one check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          VOX_SEATS:          "2"          # how many seats to target
+          VOX_MODE:           "notify"     # keep "notify" on CI (see README)
+          VOX_STATE_FILE:     "state.json"
+          # Optional: pin exact dates instead of auto next-week, e.g.:
+          # VOX_DATES: "20260818,20260819"
+        run: |
+          python watcher.py --once --state-file state.json
