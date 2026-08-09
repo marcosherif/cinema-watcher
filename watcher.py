@@ -2,23 +2,19 @@
 """
 VOX Cinemas showtimes watcher + Telegram notifier (+ optional seat "hold").
 
-MODE="notify" (default, safest): check target date; the moment it publishes IMAX
-showtimes, you get a Telegram ping with the direct booking link.
+MODE="notify" (default): the moment the target date publishes IMAX showtimes,
+send a Telegram ping with the direct booking link.
 
-MODE="hold": additionally opens the seat map, auto-selects the center / most-back
-row of the REGULAR (blue) block, and stops right before payment, sending you the
-checkout URL so YOU tap "Pay". It never enters card details.
+MODE="hold": additionally open the seat map, auto-pick the center / most-back
+row of the REGULAR (blue) block, and stop before payment (never pays).
 
-Runs two ways:
-  * Always-on loop (VPS / your PC):   python watcher.py --seats 2
-  * One-shot for schedulers (CI/cron): python watcher.py --seats 2 --once \
-                                          --state-file state.json
-
-Test/utility flags:
-    --test-telegram   send a test Telegram message and exit
-    --once            run a single check cycle then exit (no loop)
-    --state-file P    remember alerted dates in JSON P (avoids re-notifying)
-    --calibrate       open seat page, dump seat colours/classes, screenshot
+Flags:
+  --test-telegram  send a test Telegram message and exit
+  --dry-run        send a FAKE "showtimes live" alert (no real date) and exit
+  --once           single cycle then exit
+  --state-file P   remember alerted dates in JSON P (avoids re-notify)
+  --debug          save page screenshot + text for each date checked
+  --calibrate      open seat page, dump seat colours/classes, screenshot
 """
 import argparse
 import datetime as dt
@@ -35,9 +31,17 @@ import config
 
 BASE = "https://egy.voxcinemas.com/showtimes"
 
+# Chromium flags: force HTTP/1.1 (fixes net::ERR_HTTP2_PROTOCOL_ERROR some CDNs
+# throw at headless Chromium) + standard CI-friendly hardening.
+CHROMIUM_ARGS = [
+    "--disable-http2",
+    "--disable-quic",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+]
 
-# --------------------------------------------------------------------------- #
-# Telegram
+
 # --------------------------------------------------------------------------- #
 def tg_send(text: str, disable_preview: bool = False) -> None:
     token = config.TELEGRAM_BOT_TOKEN
@@ -52,16 +56,12 @@ def tg_send(text: str, disable_preview: bool = False) -> None:
                   "disable_web_page_preview": disable_preview},
             timeout=20,
         )
-        if r.status_code != 200:
-            print("[telegram] error:", r.status_code, r.text)
-        else:
-            print("[telegram] sent.")
+        print("[telegram] sent." if r.status_code == 200
+              else f"[telegram] error: {r.status_code} {r.text}")
     except Exception as e:
         print("[telegram] exception:", e)
 
 
-# --------------------------------------------------------------------------- #
-# State persistence (so schedulers don't re-alert)
 # --------------------------------------------------------------------------- #
 def load_state() -> set:
     p = config.STATE_FILE
@@ -86,8 +86,6 @@ def save_state(alerted: set) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 def target_dates() -> list:
     if config.TARGET_DATES:
         return config.TARGET_DATES
@@ -105,15 +103,46 @@ def human_date(yyyymmdd: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Page checking (Playwright)
-# --------------------------------------------------------------------------- #
+def _goto_with_retry(page, url):
+    """Navigate with retries. Returns True on success, raises on final fail."""
+    last = None
+    for attempt in range(1, config.NAV_RETRIES + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded",
+                      timeout=config.NAV_TIMEOUT_MS)
+            # give the SPA a moment to hydrate the sessions list
+            page.wait_for_timeout(3000)
+            return True
+        except Exception as e:
+            last = e
+            print(f"  [nav] attempt {attempt}/{config.NAV_RETRIES} failed: "
+                  f"{type(e).__name__}: {str(e).splitlines()[0]}")
+            page.wait_for_timeout(2000 * attempt)  # backoff
+    raise last
+
+
 def check_date(page, date_yyyymmdd: str):
-    """Return dict with found showtimes for the wanted EXPERIENCE, or None."""
+    """
+    Return one of:
+      * dict  -> showtimes found for the wanted EXPERIENCE
+      * None  -> page loaded fine but no matching showtimes yet
+      * raises -> genuine load/network error (caller distinguishes this)
+    """
     url = showtimes_url(date_yyyymmdd)
-    page.goto(url, wait_until="networkidle", timeout=60_000)
-    page.wait_for_timeout(2500)
+    _goto_with_retry(page, url)   # may raise -> real error, NOT "not available"
 
     body = page.inner_text("body")
+
+    if config.DEBUG:
+        try:
+            page.screenshot(path=f"debug_{date_yyyymmdd}.png", full_page=True)
+            with open(f"debug_{date_yyyymmdd}.txt", "w", encoding="utf-8") as f:
+                f.write(body)
+            print(f"  [debug] saved debug_{date_yyyymmdd}.png / .txt "
+                  f"(page text length={len(body)})")
+        except Exception as e:
+            print("  [debug] could not save artifacts:", e)
+
     lowered = body.lower()
     no_signals = ["no showtimes", "not available", "no sessions", "coming soon"]
     if any(s in lowered for s in no_signals) and config.EXPERIENCE.lower() not in lowered:
@@ -135,8 +164,6 @@ def check_date(page, date_yyyymmdd: str):
             "experience": config.EXPERIENCE, "times": times}
 
 
-# --------------------------------------------------------------------------- #
-# Optional seat "hold" (stops before payment)
 # --------------------------------------------------------------------------- #
 def _read_seats(page):
     return page.eval_on_selector_all(
@@ -164,13 +191,10 @@ def _read_seats(page):
 
 
 def try_hold_seats(page, hit: dict, seats: int):
-    """Auto-pick the most-backward REGULAR row (screen at top), centered, then
-    return the checkout URL WITHOUT paying. Returns URL or None."""
     try:
-        page.goto(hit["url"], wait_until="networkidle", timeout=60_000)
-        page.wait_for_timeout(2000)
+        _goto_with_retry(page, hit["url"])
         page.click(f"text={hit['times'][0]}", timeout=15_000)
-        page.wait_for_load_state("networkidle")
+        page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(2500)
 
         seats_info = _read_seats(page)
@@ -218,7 +242,7 @@ def try_hold_seats(page, hit: dict, seats: int):
         for label in ["Continue", "Proceed", "Checkout", "Confirm seats", "Next"]:
             try:
                 page.click(f"text={label}", timeout=4000)
-                page.wait_for_load_state("networkidle")
+                page.wait_for_load_state("domcontentloaded")
                 break
             except Exception:
                 continue
@@ -229,21 +253,22 @@ def try_hold_seats(page, hit: dict, seats: int):
 
 
 def calibrate(seats: int):
-    """Open the first live target date's seat page, dump seat info + screenshot."""
     from playwright.sync_api import sync_playwright
     config.HEADLESS = False
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=False, args=CHROMIUM_ARGS)
         page = browser.new_context(locale="en-US").new_page()
         for d in target_dates():
-            hit = check_date(page, d)
+            try:
+                hit = check_date(page, d)
+            except Exception as e:
+                print(f"{d}: load error {e}")
+                continue
             if not hit:
                 print(f"{d}: not live yet, skipping")
                 continue
-            page.goto(hit["url"], wait_until="networkidle", timeout=60_000)
-            page.wait_for_timeout(2000)
             page.click(f"text={hit['times'][0]}", timeout=15_000)
-            page.wait_for_load_state("networkidle")
+            page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(2500)
             seats_info = _read_seats(page)
             print(f"\nFound {len(seats_info)} seat nodes. Sample:")
@@ -258,19 +283,20 @@ def calibrate(seats: int):
 
 
 # --------------------------------------------------------------------------- #
-# Core check (one pass over all target dates)
-# --------------------------------------------------------------------------- #
 def one_pass(page, seats, mode, already_alerted):
+    errors = []
     for d in target_dates():
         if d in already_alerted:
             continue
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
         try:
             hit = check_date(page, d)
-        except Exception:
-            traceback.print_exc()
-            hit = None
+        except Exception as e:
+            msg = f"{type(e).__name__}: {str(e).splitlines()[0]}"
+            print(f"[{stamp}] {d}: LOAD ERROR -> {msg}")
+            errors.append((d, msg))
+            continue   # do NOT treat a load error as "not available"
 
-        stamp = dt.datetime.now().strftime("%H:%M:%S")
         if hit:
             print(f"[{stamp}] HIT {d}: {hit['times']}")
             tg_send(
@@ -295,15 +321,17 @@ def one_pass(page, seats, mode, already_alerted):
         else:
             print(f"[{stamp}] {d}: not available yet")
 
+    # Surface persistent load failures instead of hiding them.
+    if errors and config.NOTIFY_ON_ERROR:
+        lines = "\n".join(f"• {d}: {m}" for d, m in errors)
+        tg_send(f"⚠️ <b>VOX watcher: page load failed</b>\n{lines}\n"
+                f"(Will retry next cycle.)")
 
-# --------------------------------------------------------------------------- #
-# Runners
-# --------------------------------------------------------------------------- #
+
 def run(seats: int, mode: str):
     from playwright.sync_api import sync_playwright
 
     already_alerted = load_state()
-    # Only announce startup for the always-on loop (not every CI tick).
     if not config.RUN_ONCE:
         tg_send(
             f"👀 <b>VOX watcher started</b>\n"
@@ -313,17 +341,18 @@ def run(seats: int, mode: str):
         )
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=config.HEADLESS)
+        browser = p.chromium.launch(headless=config.HEADLESS, args=CHROMIUM_ARGS)
         ctx = browser.new_context(
             locale="en-US",
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"),
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
         page = ctx.new_page()
 
         while True:
             one_pass(page, seats, mode, already_alerted)
-
             if all(d in already_alerted for d in target_dates()):
                 if not config.RUN_ONCE:
                     tg_send("✅ All target dates handled. Watcher exiting.")
@@ -331,36 +360,50 @@ def run(seats: int, mode: str):
             if config.RUN_ONCE:
                 print("[--once] single cycle done, exiting.")
                 break
-
             sleep = config.POLL_SECONDS + random.randint(-config.JITTER_SECONDS,
                                                           config.JITTER_SECONDS)
             time.sleep(max(30, sleep))
-
         browser.close()
+
+
+def dry_run():
+    d = target_dates()[0]
+    tg_send(
+        f"🧪 <b>[TEST] The Odyssey — showtimes are LIVE!</b>\n"
+        f"📅 {human_date(d)} · {config.EXPERIENCE} @ Almaza\n"
+        f"🕒 6:45pm, 10:30pm  (sample)\n"
+        f'🔗 <a href="{showtimes_url(d)}">Open booking page</a>\n'
+        f"<i>This is a dry-run test — not a real availability alert.</i>"
+    )
 
 
 def parse_args():
     ap = argparse.ArgumentParser(description="VOX showtimes watcher + Telegram")
-    ap.add_argument("--seats", type=int, help="number of seats to target")
+    ap.add_argument("--seats", type=int)
     ap.add_argument("--mode", choices=["notify", "hold"], default=config.MODE)
-    ap.add_argument("--dates", type=str, default="",
-                    help="comma-separated YYYYMMDD; overrides auto next-week")
-    ap.add_argument("--test-telegram", action="store_true",
-                    help="send a test Telegram message and exit")
-    ap.add_argument("--once", action="store_true",
-                    help="run a single check cycle then exit")
-    ap.add_argument("--state-file", type=str, default=config.STATE_FILE,
-                    help="JSON file to remember alerted dates (avoids re-notify)")
-    ap.add_argument("--calibrate", action="store_true",
-                    help="open seat page, dump colours/classes + screenshot")
+    ap.add_argument("--dates", type=str, default="")
+    ap.add_argument("--test-telegram", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--state-file", type=str, default=config.STATE_FILE)
+    ap.add_argument("--debug", action="store_true",
+                    help="save page screenshot + text for each date")
+    ap.add_argument("--calibrate", action="store_true")
     return ap.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
+    if args.dates.strip():
+        config.TARGET_DATES = [x.strip() for x in args.dates.split(",") if x.strip()]
+    config.DEBUG = args.debug
+
     if args.test_telegram:
         tg_send("✅ VOX watcher: Telegram is wired up correctly.")
+        sys.exit(0)
+    if args.dry_run:
+        dry_run()
         sys.exit(0)
 
     seats = args.seats
@@ -375,8 +418,6 @@ if __name__ == "__main__":
                 print("Need a seat count. Example: python watcher.py --seats 2")
                 sys.exit(1)
 
-    if args.dates.strip():
-        config.TARGET_DATES = [x.strip() for x in args.dates.split(",") if x.strip()]
     config.SEATS_TO_BOOK = seats
     config.RUN_ONCE = args.once
     config.STATE_FILE = args.state_file
