@@ -1,0 +1,25 @@
+# systemd unit to run the VOX watcher 24/7 on your own Linux box / Raspberry Pi.
+# 1) Edit the placeholders below (User, path, TELEGRAM creds, seats).
+# 2) sudo cp vox-watcher.service /etc/systemd/system/vox-watcher.service
+# 3) sudo systemctl daemon-reload && sudo systemctl enable --now vox-watcher
+# 4) journalctl -u vox-watcher -f     # watch live logs
+
+[Unit]
+Description=VOX Showtimes Watcher (Telegram notifier)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- EDIT THESE ---
+User=pi
+WorkingDirectory=/home/pi/vox-watcher
+Environment=TELEGRAM_BOT_TOKEN=PUT-YOUR-BOT-TOKEN-HERE
+Environment=TELEGRAM_CHAT_ID=PUT-YOUR-CHAT-ID-HERE
+ExecStart=/home/pi/vox-watcher/.venv/bin/python watcher.py --seats 2 --mode notify
+# ------------------
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
