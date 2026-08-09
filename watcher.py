@@ -103,21 +103,34 @@ def human_date(yyyymmdd: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-def _goto_with_retry(page, url):
-    """Navigate with retries. Returns True on success, raises on final fail."""
+def _goto_with_retry(page, url, tag="page"):
+    """Navigate with retries. Uses lenient 'commit' wait (resolves as soon as
+    the server responds). On final failure, saves a screenshot + HTML so we can
+    SEE whether the CDN served a bot-challenge page. Returns True or raises."""
     last = None
     for attempt in range(1, config.NAV_RETRIES + 1):
         try:
-            page.goto(url, wait_until="domcontentloaded",
-                      timeout=config.NAV_TIMEOUT_MS)
-            # give the SPA a moment to hydrate the sessions list
-            page.wait_for_timeout(3000)
+            page.goto(url, wait_until="commit", timeout=config.NAV_TIMEOUT_MS)
+            # Let the SPA (or any challenge) settle, then continue regardless.
+            page.wait_for_timeout(6000)
             return True
         except Exception as e:
             last = e
             print(f"  [nav] attempt {attempt}/{config.NAV_RETRIES} failed: "
                   f"{type(e).__name__}: {str(e).splitlines()[0]}")
-            page.wait_for_timeout(2000 * attempt)  # backoff
+            # Always try to capture what the browser is actually seeing.
+            try:
+                page.screenshot(path=f"debug_{tag}_attempt{attempt}.png",
+                                full_page=True)
+                html = page.content()
+                with open(f"debug_{tag}_attempt{attempt}.html", "w",
+                          encoding="utf-8") as f:
+                    f.write(html)
+                snippet = " ".join(html.split())[:300]
+                print(f"  [nav] page snapshot title/snippet: {snippet!r}")
+            except Exception as ce:
+                print("  [nav] could not capture page:", ce)
+            page.wait_for_timeout(2000 * attempt)
     raise last
 
 
@@ -129,8 +142,7 @@ def check_date(page, date_yyyymmdd: str):
       * raises -> genuine load/network error (caller distinguishes this)
     """
     url = showtimes_url(date_yyyymmdd)
-    _goto_with_retry(page, url)   # may raise -> real error, NOT "not available"
-
+    _goto_with_retry(page, url, tag=date_yyyymmdd)   # may raise -> real error
     body = page.inner_text("body")
 
     if config.DEBUG:
