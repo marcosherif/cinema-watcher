@@ -1,21 +1,26 @@
 name: VOX Showtimes Watcher
 
-# Runs on a schedule (no server, no credit card needed).
-# GitHub's minimum cron granularity is 5 min; ~*/10 is a polite, reliable choice.
-# NOTE: scheduled runs can be delayed a few minutes when GitHub is busy — fine
-# for "notify me when next-week opens". You can also trigger it manually.
 on:
   schedule:
     - cron: "*/10 * * * *"     # every 10 minutes
-  workflow_dispatch:            # lets you run it on demand from the Actions tab
+  workflow_dispatch:            # run on demand from the Actions tab
+    inputs:
+      debug:
+        description: "Save page screenshot/text artifacts"
+        type: boolean
+        default: false
+      dates:
+        description: "Force dates YYYYMMDD (comma-separated), blank = auto next-week"
+        default: ""
 
-# Avoid overlapping runs.
 concurrency:
   group: vox-watcher
   cancel-in-progress: false
 
 jobs:
   check:
+    # Pinned to 22.04: on ubuntu-latest (24.04) libasound2 was renamed, breaking
+    # Playwright 1.44's dependency install.
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
@@ -40,7 +45,6 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      # Persist which dates were already alerted, so we don't ping every run.
       - name: Restore alert-state
         uses: actions/cache@v4
         with:
@@ -53,10 +57,20 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          VOX_SEATS:          "6"          # how many seats to target
-          VOX_MODE:           "notify"     # keep "notify" on CI (see README)
+          VOX_SEATS:          "2"
+          VOX_MODE:           "notify"
           VOX_STATE_FILE:     "state.json"
-          # Optional: pin exact dates instead of auto next-week, e.g.:
-          VOX_DATES: "20260816,20260820"
+          VOX_DATES:          ${{ github.event.inputs.dates }}
         run: |
-          python watcher.py --once --state-file state.json
+          python watcher.py --once --state-file state.json \
+            ${{ github.event.inputs.debug == 'true' && '--debug' || '' }}
+
+      - name: Upload debug artifacts (screenshots/text)
+        if: ${{ always() && github.event.inputs.debug == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vox-debug
+          path: |
+            debug_*.png
+            debug_*.txt
+          if-no-files-found: ignore
