@@ -53,6 +53,26 @@ jobs:
           restore-keys: |
             vox-state-
 
+      - name: Diagnostic — raw HTTP fetch (curl)
+        run: |
+          URL="https://egy.voxcinemas.com/showtimes?c=city-centre-almaza&m=the-odyssey&d=20260811"
+          echo "== HTTP status & headers =="
+          curl -sS -m 30 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+               -D - -o page.html -w "\nFINAL_HTTP_CODE=%{http_code}\nTIME_TOTAL=%{time_total}s\n" "$URL" || echo "curl exit=$?"
+          echo "== First 1200 bytes of body =="
+          head -c 1200 page.html || true
+          echo ""
+          echo "== Body size =="
+          wc -c page.html || true
+
+      - name: Upload diagnostic page
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vox-curl-diagnostic
+          path: page.html
+          if-no-files-found: warn
+          
       - name: Run one check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
