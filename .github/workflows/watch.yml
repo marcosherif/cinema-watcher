@@ -53,10 +53,10 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          VOX_SEATS:          "2"          # how many seats to target
+          VOX_SEATS:          "6"          # how many seats to target
           VOX_MODE:           "notify"     # keep "notify" on CI (see README)
           VOX_STATE_FILE:     "state.json"
           # Optional: pin exact dates instead of auto next-week, e.g.:
-          # VOX_DATES: "20260818,20260819"
+          VOX_DATES: "20260816,20260820"
         run: |
           python watcher.py --once --state-file state.json
